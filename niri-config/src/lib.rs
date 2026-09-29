@@ -30,6 +30,7 @@ pub mod macros;
 
 pub mod animations;
 pub mod appearance;
+pub mod color_profile;
 pub mod binds;
 pub mod debug;
 pub mod error;
@@ -58,7 +59,8 @@ pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
 pub use crate::utils::FloatOrInt;
-use crate::utils::{expand_home_path, Flag, MergeWith as _};
+use crate::utils::{Flag, MergeWith as _};
+pub use crate::color_profile::{ColorProfile, ColorProfileSource};
 pub use crate::window_rule::{
     FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, WindowRule,
 };
@@ -92,6 +94,7 @@ pub struct Config {
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
     pub recent_windows: RecentWindows,
+    pub color_profiles: Vec<ColorProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +172,7 @@ where
                     | "window-rule"
                     | "layer-rule"
                     | "workspace"
+                    | "color-profile"
                     | "include"
             ) && !seen.insert(name)
             {
@@ -218,6 +222,7 @@ where
                 "window-rule" => m_push!(window_rules),
                 "layer-rule" => m_push!(layer_rules),
                 "workspace" => m_push!(workspaces),
+                "color-profile" => m_push!(color_profiles),
 
                 // Single-part sections.
                 "binds" => {
@@ -967,6 +972,14 @@ mod tests {
             }
             workspace "workspace-2"
             workspace "workspace-3"
+
+            color-profile "eDP-1" {
+                source "icc"
+                icc "~/.local/share/icc/panel.icm"
+                hdr-icc "/usr/share/color/icc/panel-hdr.icm"
+                sdr-color-intensity 30
+            }
+            color-profile "DP-1"
 
             recent-windows {
                 off
@@ -2429,6 +2442,30 @@ mod tests {
                     },
                 ],
             },
+            color_profiles: [
+                ColorProfile {
+                    output: "eDP-1",
+                    source: Icc,
+                    icc: Some(
+                        "~/.local/share/icc/panel.icm",
+                    ),
+                    hdr_icc: Some(
+                        "/usr/share/color/icc/panel-hdr.icm",
+                    ),
+                    sdr_color_intensity: Some(
+                        FloatOrInt(
+                            30.0,
+                        ),
+                    ),
+                },
+                ColorProfile {
+                    output: "DP-1",
+                    source: Srgb,
+                    icc: None,
+                    hdr_icc: None,
+                    sdr_color_intensity: None,
+                },
+            ],
         }
         "#);
     }

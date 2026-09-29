@@ -4,18 +4,17 @@ use std::fmt::Write;
 use std::iter::zip;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, mem};
 
 use anyhow::{anyhow, bail, ensure, Context};
-use bytemuck::{bytes_of_mut, cast_slice_mut};
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::{MaxBpc, Modeline};
-use niri_config::{Config, OutputName};
+use niri_config::output::{HdrMode, Modeline};
+use niri_config::{ColorProfileSource, Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
@@ -63,12 +62,15 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
+use crate::color_profile::{self, DisplayProfile};
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
-use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
+use crate::utils::{
+    expand_home, get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation,
+};
 
 // When copying from rendering Nvidia dGPU to target iGPU,
 // it only understands X/Abgr and not X/Argb.
@@ -377,6 +379,10 @@ struct Surface {
     connector: connector::Handle,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
+    /// Raw EDID of the sink, for EDID-based color profiles.
+    edid: Option<Vec<u8>>,
+    /// Color profiles for this output, resolved from the config.
+    color: SurfaceColor,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
     /// Tracy frame that goes from vblank to vblank.
@@ -395,9 +401,165 @@ pub struct SurfaceDmabufFeedback {
     pub scanout: DmabufFeedback,
 }
 
+/// HDR capabilities of the connected sink, parsed from its EDID (CTA HDR static metadata and
+/// colorimetry blocks).
+#[derive(Debug, Clone, Copy, Default)]
+struct EdidHdrInfo {
+    /// The sink accepts the SMPTE ST 2084 (PQ) EOTF.
+    pq: bool,
+    /// The sink supports BT.2020 RGB signal colorimetry.
+    bt2020_rgb: bool,
+    /// Desired content max luminance in cd/m² (0 = not provided).
+    max_luminance: u16,
+    /// Desired content min luminance in 0.0001 cd/m² units (0 = not provided).
+    min_luminance: u16,
+    /// Desired content max frame-average luminance in cd/m² (0 = not provided).
+    max_frame_avg_luminance: u16,
+}
+
+impl EdidHdrInfo {
+    fn from_edid(info: &libdisplay_info::info::Info) -> Self {
+        let hdr = info.hdr_static_metadata();
+        let colorimetry = info.supported_signal_colorimetry();
+        let lum_u16 = |v: f32| v.clamp(0.0, u16::MAX as f32).round() as u16;
+        Self {
+            pq: hdr.pq,
+            bt2020_rgb: colorimetry.bt2020_rgb,
+            max_luminance: lum_u16(hdr.desired_content_max_luminance),
+            // EDID reports cd/m²; the infoframe field is in 0.0001 cd/m² units.
+            min_luminance: lum_u16(hdr.desired_content_min_luminance * 10000.),
+            max_frame_avg_luminance: lum_u16(hdr.desired_content_max_frame_avg_luminance),
+        }
+    }
+}
+
+/// An output's color profiles (`color-profile` config), and whether it is currently in HDR.
+#[derive(Debug, Default)]
+struct SurfaceColor {
+    sdr: Option<Arc<DisplayProfile>>,
+    hdr: Option<Arc<DisplayProfile>>,
+    /// SDR color intensity, 0..1.
+    intensity: f64,
+    /// Whether the connector is currently signalling HDR.
+    hdr_active: bool,
+}
+
+impl SurfaceColor {
+    fn resolve(config: &Config, name: &OutputName, edid: Option<&[u8]>, hdr_active: bool) -> Self {
+        let Some(cp) = config.color_profiles.iter().find(|cp| name.matches(&cp.output)) else {
+            return Self {
+                hdr_active,
+                ..Self::default()
+            };
+        };
+
+        let load = |path: &str| {
+            let path = PathBuf::from(path);
+            let path = expand_home(&path).ok().flatten().unwrap_or(path);
+            match DisplayProfile::load_icc(&path) {
+                Ok(profile) => {
+                    info!(
+                        connector = name.connector,
+                        "loaded color profile {path:?} ({})", profile.description
+                    );
+                    Some(Arc::new(profile))
+                }
+                Err(err) => {
+                    warn!(connector = name.connector, "error loading color profile: {err:?}");
+                    None
+                }
+            }
+        };
+
+        let sdr = match cp.source {
+            ColorProfileSource::Srgb => None,
+            ColorProfileSource::Icc => match cp.icc.as_deref() {
+                Some(path) => load(path),
+                None => {
+                    warn!(
+                        connector = name.connector,
+                        r#"color profile source is "icc" but no icc file is set"#
+                    );
+                    None
+                }
+            },
+            ColorProfileSource::Edid => {
+                let profile = edid.and_then(DisplayProfile::from_edid);
+                if profile.is_none() {
+                    warn!(connector = name.connector, "EDID has no usable color primaries");
+                }
+                profile.map(Arc::new)
+            }
+        };
+        let hdr = cp.hdr_icc.as_deref().and_then(load);
+        let intensity = cp.sdr_color_intensity.map_or(0., |v| v.0 / 100.);
+
+        Self {
+            sdr,
+            hdr,
+            intensity,
+            hdr_active,
+        }
+    }
+
+    /// The CRTC pipeline for the current state, given the CRTC's (degamma, gamma) LUT sizes.
+    fn pipeline(&self, sizes: Option<(usize, usize)>) -> color_profile::Pipeline {
+        let Some((degamma, gamma)) = sizes else {
+            return color_profile::Pipeline::default();
+        };
+        if self.hdr_active {
+            return self
+                .hdr
+                .as_deref()
+                .map(|p| color_profile::Pipeline::hdr(p, gamma))
+                .unwrap_or_default();
+        }
+        match self.sdr.as_deref() {
+            Some(profile) => color_profile::Pipeline::sdr(profile, self.intensity, degamma, gamma)
+                .unwrap_or_else(|err| {
+                    warn!("error building the color pipeline: {err:?}");
+                    color_profile::Pipeline::default()
+                }),
+            None => color_profile::Pipeline::default(),
+        }
+    }
+}
+
+impl Surface {
+    /// Programs the CRTC color pipeline for the current color profiles and SDR/HDR state.
+    fn apply_color(&mut self, drm: &DrmDevice) {
+        let Some(gamma_props) = &mut self.gamma_props else {
+            return;
+        };
+        let pipeline = self.color.pipeline(gamma_props.lut_sizes(drm));
+        if let Err(err) = gamma_props.set_pipeline(drm, pipeline) {
+            warn!(
+                connector = self.name.connector,
+                "error applying the color profile: {err:?}"
+            );
+        }
+    }
+}
+
+/// The CRTC color pipeline: `DEGAMMA_LUT` -> `CTM` -> `GAMMA_LUT`.
+///
+/// Two things feed it: the output's color profile (see [`crate::color_profile`]), and gamma ramps
+/// from gamma-control clients (night light). The ramp is applied after the profile's output
+/// curve, so both work together.
 struct GammaProps {
     crtc: crtc::Handle,
-    mode: GammaMode,
+    gamma_lut: property::Handle,
+    gamma_lut_size: property::Handle,
+    previous_blob: Option<NonZeroU64>,
+    /// `DEGAMMA_LUT`, `DEGAMMA_LUT_SIZE` and `CTM`, when the driver has them.
+    degamma_lut: Option<(property::Handle, property::Handle)>,
+    ctm: Option<property::Handle>,
+    previous_degamma_blob: Option<NonZeroU64>,
+    previous_ctm_blob: Option<NonZeroU64>,
+    /// Gamma ramp last set by a gamma-control client.
+    ramp: Option<Vec<u16>>,
+    /// Pipeline from the output's color profile for the current SDR/HDR state.
+    pipeline: color_profile::Pipeline,
 }
 
 enum GammaMode {
@@ -1548,12 +1710,17 @@ impl Tty {
         let sequence_delta_plot_name =
             tracy_client::PlotName::new_leak(format!("{connector_name} sequence delta"));
 
+        let edid = get_edid_data(&device.drm, connector.handle()).ok();
+        let color = SurfaceColor::resolve(&self.config.borrow(), &output_name, edid.as_deref(), false);
+
         let surface = Surface {
             name: output_name,
             connector: connector.handle(),
             compositor,
             dmabuf_feedback,
             gamma_props,
+            edid,
+            color,
             pending_gamma_change: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -1564,6 +1731,9 @@ impl Tty {
 
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
+        if let Some(surface) = device.surfaces.get_mut(&crtc) {
+            surface.apply_color(&device.drm);
+        }
 
         niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
 
@@ -1898,6 +2068,105 @@ impl Tty {
             // This branch hits any time we try to render while the user had switched to a
             // different VT, so don't print anything here.
             return rv;
+        }
+
+        // Reconcile the output's blend space and HDR signalling with the config and content.
+        //
+        // With hdr mode="on", the connector stays in HDR (BT.2020 + PQ) and the desktop is
+        // composited into that blend space. In auto mode, HDR engages only while a fullscreen
+        // surface carries an HDR image description (passthrough), so the output is SDR
+        // otherwise.
+        //
+        // The connector state is only *staged* here; smithay applies it inside its own commit
+        // as a single atomic modeset together with mode, CRTC and plane state (committing
+        // connector color properties standalone hangs some drivers, notably nvidia).
+        let (blend_hdr, hdr_content, reference_luminance) = {
+            let config = self.config.borrow();
+            let output_config = config.outputs.find(&surface.name);
+            let hdr_config = output_config.and_then(|o| o.hdr.clone());
+            let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
+            let max_bpc = output_config
+                .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
+                .unwrap_or(None);
+            let always_on = hdr_config.as_ref().is_some_and(|h| h.mode == HdrMode::On);
+            let reference_luminance = hdr_config
+                .as_ref()
+                .and_then(|h| h.reference_luminance)
+                .map(|v| v.0)
+                .unwrap_or(DEFAULT_REFERENCE_LUMINANCE);
+            drop(config);
+
+            let hdr_desc = hdr_allowed
+                .then(|| niri.output_hdr_image_description(output))
+                .flatten();
+            let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
+
+            let desired = if blend_hdr {
+                // Without fullscreen HDR content, the metadata comes from the sink's EDID.
+                let desc = hdr_desc.unwrap_or(ImageDescription {
+                    transfer: CmTransferFunction::St2084Pq,
+                    primaries: CmPrimariesOption {
+                        named: Some(CmPrimaries::Bt2020),
+                        values: None,
+                    },
+                    max_cll: None,
+                    max_fall: None,
+                    mastering_luminance: None,
+                    mastering_primaries: None,
+                    luminances: None,
+                    windows_scrgb: false,
+                    windows_bt2100: false,
+                });
+                ConnectorColorState {
+                    colorspace: Colorspace::Bt2020Rgb,
+                    hdr_metadata: Some(build_hdr_metadata(&desc, &surface.edid_hdr)),
+                    max_bpc,
+                }
+            } else {
+                ConnectorColorState {
+                    colorspace: Colorspace::Default,
+                    hdr_metadata: None,
+                    max_bpc,
+                }
+            };
+
+            if surface.compositor.pending_color_state() != desired
+                && surface.failed_color_state != Some(desired)
+            {
+                match surface.compositor.use_color_state(desired) {
+                    Ok(()) => {
+                        surface.failed_color_state = None;
+                        info!(
+                            connector = surface.name.connector,
+                            hdr = desired.hdr_metadata.is_some(),
+                            "updated HDR signalling to match content"
+                        );
+                        // Swap the SDR color pipeline for the HDR one (or back).
+                        let hdr_active = desired.hdr_metadata.is_some();
+                        if surface.color.hdr_active != hdr_active {
+                            surface.color.hdr_active = hdr_active;
+                            surface.apply_color(&device.drm);
+                        }
+                    }
+                    Err(err) => {
+                        surface.failed_color_state = Some(desired);
+                        warn!("failed to update HDR signalling: {err:?}");
+                    }
+                }
+            }
+
+            (blend_hdr, hdr_desc.is_some(), reference_luminance)
+        };
+
+        // A blend-space change alters what every shader outputs without any element damage;
+        // force a full redraw. Only drop the damage history: reset_buffers() would free the
+        // whole swapchain here, in the middle of rendering, while earlier frames may still be
+        // in flight on the GPU or queued for scanout - the format doesn't change, so there is
+        // nothing to reallocate.
+        let blend = blend_hdr.then_some(reference_luminance);
+        if surface.last_blend != Some(blend) {
+            surface.last_blend = Some(blend);
+            surface.compositor.reset_buffer_ages();
         }
 
         let mut renderer = match self.gpu_manager.renderer(
@@ -2468,6 +2737,14 @@ impl Tty {
                     warn!("failed to get connector properties");
                 }
 
+                surface.color = SurfaceColor::resolve(
+                    &self.config.borrow(),
+                    &surface.name,
+                    surface.edid.as_deref(),
+                    surface.color.hdr_active,
+                );
+                surface.apply_color(&device.drm);
+
                 let change_mode = surface.compositor.pending_mode() != mode;
 
                 let vrr_enabled = surface.compositor.vrr_enabled();
@@ -2634,6 +2911,8 @@ impl GammaProps {
     fn new(device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<Self> {
         let mut gamma_lut = None;
         let mut gamma_lut_size = None;
+        let mut degamma_lut = None;
+        let mut degamma_lut_size = None;
         let mut ctm = None;
 
         let props = device
@@ -2670,6 +2949,17 @@ impl GammaProps {
                         debug!("wrong CTM value type");
                     }
                 }
+                "DEGAMMA_LUT" if matches!(info.value_type(), property::ValueType::Blob) => {
+                    degamma_lut = Some(prop);
+                }
+                "DEGAMMA_LUT_SIZE"
+                    if matches!(info.value_type(), property::ValueType::UnsignedRange(_, _)) =>
+                {
+                    degamma_lut_size = Some(prop);
+                }
+                "CTM" if matches!(info.value_type(), property::ValueType::Blob) => {
+                    ctm = Some(prop);
+                }
                 _ => (),
             }
         }
@@ -2701,7 +2991,18 @@ impl GammaProps {
             }
         };
 
-        Ok(Self { crtc, mode })
+        Ok(Self {
+            crtc,
+            gamma_lut,
+            gamma_lut_size,
+            previous_blob: None,
+            degamma_lut: degamma_lut.zip(degamma_lut_size),
+            ctm,
+            previous_degamma_blob: None,
+            previous_ctm_blob: None,
+            ramp: None,
+            pipeline: color_profile::Pipeline::default(),
+        })
     }
 
     fn gamma_size(&self) -> u32 {
@@ -2712,113 +3013,129 @@ impl GammaProps {
         }
     }
 
-    fn set_gamma(&mut self, device: &DrmDevice, gamma: Option<Vec<u16>>) -> anyhow::Result<()> {
+    fn degamma_size(&self, device: &DrmDevice) -> Option<usize> {
+        let (_, size) = self.degamma_lut?;
+        get_drm_property(device, self.crtc, size).map(|v| v as usize)
+    }
+
+    /// Whether the driver has the full pipeline needed for color profiles.
+    fn supports_color_profiles(&self) -> bool {
+        self.degamma_lut.is_some() && self.ctm.is_some()
+    }
+
+    /// Sizes (degamma, gamma) for building a [`color_profile::Pipeline`] for this CRTC.
+    fn lut_sizes(&self, device: &DrmDevice) -> Option<(usize, usize)> {
+        let gamma = self.gamma_size(device).ok()? as usize;
+        let degamma = self.degamma_size(device)?;
+        Some((degamma, gamma))
+    }
+
+    fn set_gamma(&mut self, device: &DrmDevice, gamma: Option<&[u16]>) -> anyhow::Result<()> {
         let _span = tracy_client::span!("GammaProps::set_gamma");
 
-        let (prop, prop_name) = match &mut self.mode {
-            GammaMode::Lut { gamma_lut, .. } => (*gamma_lut, "GAMMA_LUT"),
-            GammaMode::Ctm { ctm, .. } => (*ctm, "CTM"),
-            GammaMode::Legacy {
-                gamma_size,
-                previous_ramp,
-            } => {
-                set_gamma_for_crtc(device, self.crtc, *gamma_size, gamma.as_deref())?;
-                *previous_ramp = gamma;
-                return Ok(());
-            }
-        };
-
-        let blob = if let Some(gamma) = gamma {
-            let gamma_size = self.gamma_size() as usize;
-
+        if let Some(gamma) = gamma {
+            let gamma_size = self
+                .gamma_size(device)
+                .context("error getting gamma size")? as usize;
             ensure!(gamma.len() == gamma_size * 3, "wrong gamma length");
-
-            #[allow(non_camel_case_types)]
-            #[repr(C)]
-            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-            pub struct drm_color_lut {
-                pub red: u16,
-                pub green: u16,
-                pub blue: u16,
-                pub reserved: u16,
-            }
-            #[allow(non_camel_case_types)]
-            #[repr(C)]
-            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-            pub struct drm_color_ctm {
-                pub matrix: [u64; 9],
-            }
-
-            let (red, rest) = gamma.split_at(gamma_size);
-            let (green, blue) = rest.split_at(gamma_size);
-            let blob = if let GammaMode::Lut { .. } = self.mode {
-                let mut data = zip(zip(red, green), blue)
-                    .map(|((&red, &green), &blue)| drm_color_lut {
-                        red,
-                        green,
-                        blue,
-                        reserved: 0,
-                    })
-                    .collect::<Vec<_>>();
-
-                drm_ffi::mode::create_property_blob(device.as_fd(), cast_slice_mut(&mut data))
-                    .context("error creating property blob")?
-            } else {
-                /// Transforms a u16 gamma value into a S31.32 value for the CTM matrix.
-                fn from_u16_to_s31_32(value: u16) -> u64 {
-                    let normalized = value as f64 / u16::MAX as f64;
-                    (normalized * (1u64 << 32) as f64) as u64
-                }
-
-                // See https://invent.kde.org/plasma/kwin/-/commit/f2417a85233e1b7c1c68039230c45554f1069694
-                // and https://melissawen.github.io/blog/2023/08/21/amd-steamdeck-colors
-                // for context. Create an approximation for color conversion based on
-                // a linear interpretation of the gamma ramp received.
-                let mut data = drm_color_ctm {
-                    matrix: [
-                        from_u16_to_s31_32(red[gamma_size - 1]),
-                        0,
-                        0,
-                        0,
-                        from_u16_to_s31_32(green[gamma_size - 1]),
-                        0,
-                        0,
-                        0,
-                        from_u16_to_s31_32(blue[gamma_size - 1]),
-                    ],
-                };
-
-                drm_ffi::mode::create_property_blob(device.as_fd(), bytes_of_mut(&mut data))
-                    .context("error creating property blob")?
-            };
-            NonZeroU64::new(u64::from(blob.blob_id))
-        } else {
-            None
-        };
-
-        {
-            let _span = tracy_client::span!("set_property");
-
-            let blob = blob.map(NonZeroU64::get).unwrap_or(0);
-            device
-                .set_property(self.crtc, prop, property::Value::Blob(blob).into())
-                .with_context(|| format!("error setting {prop_name}"))
-                .inspect_err(|_| {
-                    if blob != 0 {
-                        // Destroy the blob we just allocated.
-                        if let Err(err) = device.destroy_property_blob(blob) {
-                            warn!("error destroying {prop_name} property blob: {err:?}");
-                        }
-                    }
-                })?;
         }
 
-        if let GammaMode::Lut { previous_blob, .. } | GammaMode::Ctm { previous_blob, .. } =
-            &mut self.mode
-        {
-            if let Some(blob) = mem::replace(previous_blob, blob) {
-                if let Err(err) = device.destroy_property_blob(blob.get()) {
-                    warn!("error destroying previous {prop_name} blob: {err:?}");
+        self.ramp = gamma.map(<[u16]>::to_vec);
+        self.apply(device)
+    }
+
+    fn set_pipeline(
+        &mut self,
+        device: &DrmDevice,
+        pipeline: color_profile::Pipeline,
+    ) -> anyhow::Result<()> {
+        if self.pipeline == pipeline {
+            return Ok(());
+        }
+        self.pipeline = pipeline;
+        self.apply(device)
+    }
+
+    /// Programs `DEGAMMA_LUT`, `CTM` and `GAMMA_LUT` from the current pipeline and ramp.
+    fn apply(&mut self, device: &DrmDevice) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("GammaProps::apply");
+
+        let pipeline = &self.pipeline;
+        let needs_full = pipeline.degamma.is_some() || pipeline.ctm.is_some();
+        let use_pipeline = !needs_full || self.supports_color_profiles();
+        if !use_pipeline {
+            warn!("the driver lacks DEGAMMA_LUT/CTM on this CRTC; ignoring the color profile");
+        }
+        let curve = use_pipeline.then_some(pipeline.gamma.as_deref()).flatten();
+
+        let gamma_size = self
+            .gamma_size(device)
+            .context("error getting gamma size")? as usize;
+
+        let mut created = Vec::new();
+        let result = (|| -> anyhow::Result<[Option<NonZeroU64>; 3]> {
+            let gamma = if curve.is_none() && self.ramp.is_none() {
+                None
+            } else {
+                let lut = color_profile::compose_ramp(curve, self.ramp.as_deref(), gamma_size);
+                let blob = create_color_lut_blob(device, &lut)?;
+                created.push(blob);
+                Some(blob)
+            };
+
+            let (mut degamma, mut ctm) = (None, None);
+            if use_pipeline {
+                if let Some(lut) = &pipeline.degamma {
+                    let blob = create_color_lut_blob(device, &color_profile::to_u16_lut(lut))?;
+                    created.push(blob);
+                    degamma = Some(blob);
+                }
+                if let Some(matrix) = &pipeline.ctm {
+                    let data = color_profile::ctm_to_drm(matrix);
+                    let blob = create_blob(device, bytemuck::cast_slice(&data))?;
+                    created.push(blob);
+                    ctm = Some(blob);
+                }
+            }
+
+            let set = |prop: property::Handle, blob: Option<NonZeroU64>, name: &str| {
+                let blob = blob.map(NonZeroU64::get).unwrap_or(0);
+                device
+                    .set_property(self.crtc, prop, property::Value::Blob(blob).into())
+                    .with_context(|| format!("error setting {name}"))
+            };
+            // Program the output end last, so a failure in between leaves the old curve.
+            if let Some((prop, _)) = self.degamma_lut {
+                set(prop, degamma, "DEGAMMA_LUT")?;
+            }
+            if let Some(prop) = self.ctm {
+                set(prop, ctm, "CTM")?;
+            }
+            set(self.gamma_lut, gamma, "GAMMA_LUT")?;
+
+            Ok([degamma, ctm, gamma])
+        })();
+
+        let [degamma, ctm, gamma] = match result {
+            Ok(blobs) => blobs,
+            Err(err) => {
+                for blob in created {
+                    if let Err(err) = device.destroy_property_blob(blob.get()) {
+                        warn!("error destroying color property blob: {err:?}");
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        for (previous, new) in [
+            (&mut self.previous_degamma_blob, degamma),
+            (&mut self.previous_ctm_blob, ctm),
+            (&mut self.previous_blob, gamma),
+        ] {
+            if let Some(old) = mem::replace(previous, new) {
+                if let Err(err) = device.destroy_property_blob(old.get()) {
+                    warn!("error destroying previous color property blob: {err:?}");
                 }
             }
         } else {
@@ -2832,33 +3149,53 @@ impl GammaProps {
     fn restore_gamma(&self, device: &DrmDevice) -> anyhow::Result<()> {
         let _span = tracy_client::span!("GammaProps::restore_gamma");
 
-        match &self.mode {
-            GammaMode::Lut {
-                gamma_lut,
-                previous_blob,
-                ..
-            } => {
-                let blob = previous_blob.map(NonZeroU64::get).unwrap_or(0);
-                device
-                    .set_property(self.crtc, *gamma_lut, property::Value::Blob(blob).into())
-                    .context("error setting GAMMA_LUT")?;
-            }
-            GammaMode::Ctm { ctm, previous_blob } => {
-                let blob = previous_blob.map(NonZeroU64::get).unwrap_or(0);
-                device
-                    .set_property(self.crtc, *ctm, property::Value::Blob(blob).into())
-                    .context("error setting CTM")?;
-            }
-            GammaMode::Legacy {
-                gamma_size,
-                previous_ramp,
-            } => {
-                set_gamma_for_crtc(device, self.crtc, *gamma_size, previous_ramp.as_deref())?;
-            }
+        let set = |prop: property::Handle, blob: Option<NonZeroU64>, name: &str| {
+            let blob = blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(self.crtc, prop, property::Value::Blob(blob).into())
+                .with_context(|| format!("error setting {name}"))
+        };
+        if let Some((prop, _)) = self.degamma_lut {
+            set(prop, self.previous_degamma_blob, "DEGAMMA_LUT")?;
         }
+        if let Some(prop) = self.ctm {
+            set(prop, self.previous_ctm_blob, "CTM")?;
+        }
+        set(self.gamma_lut, self.previous_blob, "GAMMA_LUT")?;
 
         Ok(())
     }
+}
+
+fn create_blob(device: &DrmDevice, data: &[u8]) -> anyhow::Result<NonZeroU64> {
+    let mut data = data.to_vec();
+    let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut data)
+        .context("error creating property blob")?;
+    NonZeroU64::new(u64::from(blob.blob_id)).context("driver returned a zero blob id")
+}
+
+/// Creates a `drm_color_lut` blob.
+fn create_color_lut_blob(device: &DrmDevice, lut: &[[u16; 3]]) -> anyhow::Result<NonZeroU64> {
+    #[allow(non_camel_case_types)]
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct drm_color_lut {
+        red: u16,
+        green: u16,
+        blue: u16,
+        reserved: u16,
+    }
+
+    let data = lut
+        .iter()
+        .map(|&[red, green, blue]| drm_color_lut {
+            red,
+            green,
+            blue,
+            reserved: 0,
+        })
+        .collect::<Vec<_>>();
+    create_blob(device, bytemuck::cast_slice(&data))
 }
 
 fn primary_node_from_render_node(path: &Path) -> Option<(DrmNode, DrmNode)> {
@@ -3336,10 +3673,7 @@ fn pick_mode(
     mode.map(|m| (*m, fallback))
 }
 
-fn get_edid_info(
-    device: &DrmDevice,
-    connector: connector::Handle,
-) -> anyhow::Result<libdisplay_info::info::Info> {
+fn get_edid_data(device: &DrmDevice, connector: connector::Handle) -> anyhow::Result<Vec<u8>> {
     let (_, info, value) =
         find_drm_property(device, connector, "EDID").context("no EDID property")?;
     let blob = info
@@ -3347,9 +3681,16 @@ fn get_edid_info(
         .convert_value(value)
         .as_blob()
         .context("EDID was not blob type")?;
-    let data = device
+    device
         .get_property_blob(blob)
-        .context("error getting EDID blob value")?;
+        .context("error getting EDID blob value")
+}
+
+fn get_edid_info(
+    device: &DrmDevice,
+    connector: connector::Handle,
+) -> anyhow::Result<libdisplay_info::info::Info> {
+    let data = get_edid_data(device, connector)?;
     libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
 }
 
